@@ -111,32 +111,45 @@ class CoalescingEmbeddingModel:
                 self._flusher = asyncio.create_task(self._flush(), name="coalescing-embedding-flush")
 
     async def _drain(self, waiters: list[_Waiter]) -> None:  # noqa: C901 - batch fan-out
+        live = [waiter for waiter in waiters if not waiter.future.done()]
+        if not live:
+            # Every caller went away: do not spend a provider request on them.
+            return
         pending: list[str] = []
-        for waiter in waiters:
+        for waiter in live:
             for text in waiter.missing:
                 if text not in pending:
                     pending.append(text)
 
         vectors: dict[str, tuple[float, ...]] = {}
         batches: list[tuple[set[str], InferenceUsage]] = []
-        try:
-            for start in range(0, len(pending), self._max_batch_size):
-                batch = tuple(pending[start : start + self._max_batch_size])
+        failed: set[str] = set()
+        for start in range(0, len(pending), self._max_batch_size):
+            batch = tuple(pending[start : start + self._max_batch_size])
+            if set(batch) <= failed:
+                continue
+            try:
                 result = await self._model.embed(batch)
-                for text, vector in _batch_vectors(batch, result):
-                    vectors[text] = vector
-                batches.append((set(batch), result.usage))
-        except BaseException as error:  # a failed provider call must not be cached
-            for waiter in waiters:
-                if not waiter.future.done():
-                    waiter.future.set_exception(error)
-            return
+                produced = _batch_vectors(batch, result)
+            except Exception as error:  # a failed batch only fails the callers that needed it
+                failed.update(batch)
+                for waiter in live:
+                    if not waiter.future.done() and set(waiter.missing) & set(batch):
+                        waiter.future.set_exception(error)
+                continue
+            for text, vector in produced:
+                vectors[text] = vector
+                # Cache per successful batch so a later failure never discards it.
+                self._remember(text, vector)
+            batches.append((set(batch), result.usage))
 
-        for text, vector in vectors.items():
-            self._remember(text, vector)
         for waiter in waiters:
             if waiter.future.done():
                 # A cancelled caller never blocks the others.
+                continue
+            unresolved = [text for text in waiter.missing if text not in vectors]
+            if unresolved:
+                waiter.future.set_exception(RuntimeError(f"embedding provider did not return {unresolved[0]!r}"))
                 continue
             waiter.future.set_result(
                 EmbeddingResult(

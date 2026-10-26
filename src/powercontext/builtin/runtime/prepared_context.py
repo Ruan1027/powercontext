@@ -766,11 +766,13 @@ def _render_entry(entry: _PreparedContextEntry) -> dict[str, object]:
     rendered: dict[str, object] = {
         "citation": entry.citation,
         "content": entry.content,
-        "truncated": entry.truncated,
     }
     if entry.start is not None and entry.end is not None:
+        # Selected fragments are literal slices, never truncated prefixes.
         rendered["start"] = entry.start
         rendered["end"] = entry.end
+    else:
+        rendered["truncated"] = entry.truncated
     if entry.kind != "memory":
         rendered["kind"] = entry.kind
     return rendered
@@ -787,7 +789,7 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
 
 
 _EVIDENCE_TOKEN = re.compile(r"[a-z0-9]+")
-_EVIDENCE_SENTENCE = re.compile(r"[^.!?\n]+[.!?]*")
+_EVIDENCE_BREAK = re.compile(r"[.!?]+|\n+")
 
 
 def _query_terms(query: str) -> tuple[str, ...]:
@@ -828,8 +830,7 @@ def _rank_evidence_spans(
                 "entry_id": hit.entry_id,
                 "entry_version_id": hit.entry_version_id,
             }
-            for match in _EVIDENCE_SENTENCE.finditer(text):
-                start, end = match.span()
+            for start, end in _text_spans(text):
                 body = text[start:end]
                 if not body.strip():
                     continue
@@ -850,6 +851,34 @@ def _rank_evidence_spans(
                 else:
                     filler.append((entry, fragment))
     ranked.sort(key=lambda item: (item[0], item[1]))
-    ordered = [(entry, fragment) for _score, _order, entry, fragment in ranked]
+    ordered: list[tuple[_PreparedContextEntry, MemoryFragment]] = []
+    seen_documents: set[str] = set()
+    for _score, _order, entry, fragment in ranked:
+        document = _document_key(entry)
+        if document in seen_documents:
+            continue
+        seen_documents.add(document)
+        ordered.append((entry, fragment))
+    ordered.extend((entry, fragment) for _score, _order, entry, fragment in ranked)
     ordered.extend(filler)
     return ordered
+
+
+def _text_spans(text: str) -> list[tuple[int, int]]:
+    """Split text into contiguous spans so no separator is left uncovered."""
+
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for match in _EVIDENCE_BREAK.finditer(text):
+        end = match.end()
+        if end > start and text[start:end].strip():
+            spans.append((start, end))
+        start = end
+    if start < len(text) and text[start:].strip():
+        spans.append((start, len(text)))
+    return spans
+
+
+def _document_key(entry: _PreparedContextEntry) -> str:
+    citation = entry.citation
+    return str(citation.get("memory_ref", citation.get("scope_id", "")))
