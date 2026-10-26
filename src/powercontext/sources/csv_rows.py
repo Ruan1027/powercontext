@@ -65,7 +65,7 @@ def csv_row_source_id(document_id: str, primary_key_value: str) -> str:
 
     _require_trimmed_non_empty(document_id, "document_id")
     if not isinstance(primary_key_value, str):
-        raise ValueError("primary_key_value must be a string")  # noqa: TRY003
+        raise ValueError("primary_key_value must be a string")  # noqa: TRY003, TRY004
     source_id = f"csv:{quote(document_id, safe='')}:{quote(primary_key_value, safe='')}"
     if len(source_id) > MAX_SOURCE_ID_LENGTH:
         raise ValueError(f"row source id must not exceed {MAX_SOURCE_ID_LENGTH} characters")  # noqa: TRY003
@@ -121,7 +121,7 @@ def parse_csv_document(value: CSVDocumentInput, /) -> tuple[CSVRowInput, ...]:
                 )
             )
     except csv.Error as error:
-        raise ValueError(f"malformed CSV document: {error}") from error
+        raise ValueError(f"malformed CSV document: {error}") from error  # noqa: TRY003
     return tuple(rows)
 
 
@@ -129,9 +129,9 @@ def _read_header(reader: csv.reader) -> list[str]:
     try:
         header = next(reader)
     except StopIteration:
-        raise ValueError("CSV document must contain a header record") from None
+        raise ValueError("CSV document must contain a header record") from None  # noqa: TRY003
     except csv.Error as error:
-        raise ValueError(f"malformed CSV document: {error}") from error
+        raise ValueError(f"malformed CSV document: {error}") from error  # noqa: TRY003
     if not header:
         raise ValueError("CSV document must contain a header record")  # noqa: TRY003
     seen: set[str] = set()
