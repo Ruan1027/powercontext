@@ -14,20 +14,25 @@
 
 """Propagate Source withdrawal through the evidence DAG of one Scope."""
 
+# ruff: noqa: TRY003 - every lifecycle error carries its own diagnostic text.
 from __future__ import annotations
 
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import Column, String, Table, delete, insert, select, update
 
 from powercontext.artifacts import ArtifactRef, MemoryCitation
-from powercontext.builtin.persistence.tables import SHARED_METADATA
+from powercontext.builtin.persistence.sqlite.topic_memory_index import (
+    _DELETE_CHUNK_FTS_SQL,
+    _DELETE_TOPIC_FTS_SQL,
+    _INSERT_CHUNK_FTS_SQL,
+    _INSERT_TOPIC_FTS_SQL,
+)
 from powercontext.builtin.persistence.tables import (
+    SHARED_METADATA,
     SOURCE_LIFECYCLE_TABLE,
-    TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE,
-    TOPIC_MEMORY_ACTIVE_TOPICS_TABLE,
 )
 from powercontext.sources.models import SourceRef
 
@@ -54,21 +59,21 @@ class SourceLifecycleEvent(BaseModel):
     @classmethod
     def validate_text(cls, value: str) -> str:
         if not isinstance(value, str) or not value.strip():
-            raise ValueError("must be a non-empty string")  # noqa: TRY003
+            raise ValueError("must be a non-empty string")
         return value
 
     @field_validator("revision", "sequence")
     @classmethod
     def validate_positive(cls, value: int) -> int:
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-            raise ValueError("must be a positive integer")  # noqa: TRY003
+            raise ValueError("must be a positive integer")
         return value
 
     @field_validator("available")
     @classmethod
     def validate_available(cls, value: bool) -> bool:
         if not isinstance(value, bool):
-            raise ValueError("must be a boolean")  # noqa: TRY003
+            raise ValueError("must be a boolean")  # noqa: TRY004
         return value
 
 
@@ -125,9 +130,7 @@ class ScopeSourceLifecycle:
     ) -> None:
         if not isinstance(citation, MemoryCitation):
             raise SourceLifecycleError("memory registration requires a MemoryCitation")
-        await self._register(
-            _node_id(node_id), "memory", citation.model_dump(mode="json"), parents, _policy(policy), 0
-        )
+        await self._register(_node_id(node_id), "memory", citation.model_dump(mode="json"), parents, _policy(policy), 0)
 
     async def register_topic(
         self,
@@ -183,7 +186,7 @@ class ScopeSourceLifecycle:
             raise SourceLifecycleError(f"node {node_id!r} is not available for generation")
         return _reference(node)
 
-    async def _register(
+    async def _register(  # noqa: C901
         self,
         node_id: str,
         family: Family,
@@ -284,19 +287,41 @@ class ScopeSourceLifecycle:
                 else:
                     await self._hide_topic(connection, node_id, ref)
 
-
     async def _hide_topic(self, connection: Any, node_id: str, ref: ArtifactRef) -> None:
-        snapshot: list[list[dict[str, Any]]] = []
-        for table in (TOPIC_MEMORY_ACTIVE_TOPICS_TABLE, TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE):
-            rows = (
+        """Drop the searchable projections while keeping the artifact readable."""
+
+        from sqlalchemy import text
+
+        identity = {"scope_id": self._scope_id, "artifact_id": ref.artifact_id}
+        topic_rows = (
+            (
                 await connection.execute(
-                    select(table).where(table.c.scope_id == self._scope_id, table.c.artifact_id == ref.artifact_id)
+                    text(
+                        "SELECT scope_id, artifact_id, revision, title, summary, searchable_text "
+                        "FROM pc_topic_memory_topic_fts WHERE scope_id = :scope_id AND artifact_id = :artifact_id"
+                    ),
+                    identity,
                 )
-            ).mappings().all()
-            snapshot.append([dict(row) for row in rows])
-            await connection.execute(
-                delete(table).where(table.c.scope_id == self._scope_id, table.c.artifact_id == ref.artifact_id)
             )
+            .mappings()
+            .all()
+        )
+        chunk_rows = (
+            (
+                await connection.execute(
+                    text(
+                        "SELECT scope_id, artifact_id, revision, chunk_ordinal, start_offset, title, summary, "
+                        "chunk_text, searchable_text FROM pc_topic_memory_chunk_fts "
+                        "WHERE scope_id = :scope_id AND artifact_id = :artifact_id"
+                    ),
+                    identity,
+                )
+            )
+            .mappings()
+            .all()
+        )
+        await connection.execute(_DELETE_TOPIC_FTS_SQL, identity)
+        await connection.execute(_DELETE_CHUNK_FTS_SQL, identity)
         await connection.execute(
             delete(_snapshot_table()).where(
                 _snapshot_table().c.scope_id == self._scope_id, _snapshot_table().c.node_id == node_id
@@ -304,7 +329,12 @@ class ScopeSourceLifecycle:
         )
         await connection.execute(
             insert(_snapshot_table()).values(
-                scope_id=self._scope_id, node_id=node_id, payload=json.dumps(snapshot)
+                scope_id=self._scope_id,
+                node_id=node_id,
+                payload=json.dumps({
+                    "topics": [dict(row) for row in topic_rows],
+                    "chunks": [dict(row) for row in chunk_rows],
+                }),
             )
         )
 
@@ -319,9 +349,10 @@ class ScopeSourceLifecycle:
         if not stored:
             return
         snapshot = json.loads(stored)
-        for table, rows in zip((TOPIC_MEMORY_ACTIVE_TOPICS_TABLE, TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE), snapshot):
-            for row in rows:
-                await connection.execute(insert(table).values(**row))
+        for row in snapshot.get("topics", ()):
+            await connection.execute(_INSERT_TOPIC_FTS_SQL, row)
+        for row in snapshot.get("chunks", ()):
+            await connection.execute(_INSERT_CHUNK_FTS_SQL, row)
         await connection.execute(
             delete(_snapshot_table()).where(
                 _snapshot_table().c.scope_id == self._scope_id, _snapshot_table().c.node_id == node_id
