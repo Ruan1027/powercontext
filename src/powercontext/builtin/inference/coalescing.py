@@ -110,7 +110,7 @@ class CoalescingEmbeddingModel:
             if self._waiters:
                 self._flusher = asyncio.create_task(self._flush(), name="coalescing-embedding-flush")
 
-    async def _drain(self, waiters: list[_Waiter]) -> None:
+    async def _drain(self, waiters: list[_Waiter]) -> None:  # noqa: C901 - batch fan-out
         pending: list[str] = []
         for waiter in waiters:
             for text in waiter.missing:
@@ -123,10 +123,8 @@ class CoalescingEmbeddingModel:
             for start in range(0, len(pending), self._max_batch_size):
                 batch = tuple(pending[start : start + self._max_batch_size])
                 result = await self._model.embed(batch)
-                if len(result.vectors) != len(batch):
-                    raise ValueError("embedding provider returned a mismatched vector count")  # noqa: TRY003
-                for text, vector in zip(batch, result.vectors, strict=True):
-                    vectors[text] = tuple(float(value) for value in vector)
+                for text, vector in _batch_vectors(batch, result):
+                    vectors[text] = vector
                 batches.append((set(batch), result.usage))
         except BaseException as error:  # a failed provider call must not be cached
             for waiter in waiters:
@@ -154,6 +152,14 @@ class CoalescingEmbeddingModel:
             return
         while len(self._cache) > self._cache_size:
             self._cache.popitem(last=False)
+
+
+def _batch_vectors(batch: tuple[str, ...], result: EmbeddingResult) -> tuple[tuple[str, tuple[float, ...]], ...]:
+    if len(result.vectors) != len(batch):
+        raise ValueError("embedding provider returned a mismatched vector count")  # noqa: TRY003
+    return tuple(
+        (text, tuple(float(value) for value in vector)) for text, vector in zip(batch, result.vectors, strict=True)
+    )
 
 
 def _usage_for(waiter: _Waiter, batches: list[tuple[set[str], InferenceUsage]]) -> InferenceUsage:
