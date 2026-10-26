@@ -127,6 +127,7 @@ from powercontext.builtin.runtime.artifact_processing import (
     SpawnArtifactProcessingWorkerLauncher,
 )
 from powercontext.builtin.runtime.config import BuiltinConfig, ExternalSkillsConfig, InferenceConfig, RuntimeConfig
+from powercontext.builtin.runtime.count_trigger import SourceCountTrigger
 from powercontext.builtin.runtime.decision_model import (
     DECISION_INSTRUCTIONS,
     DecisionInput,
@@ -165,6 +166,7 @@ from powercontext.builtin.sources import (
     BUILTIN_SOURCE_REGISTRY,
     TEXT_EVIDENCE_PROJECTION_KEY,
 )
+from powercontext.builtin.triggers.source_window import SOURCE_WINDOW_TRIGGER_NAME
 from powercontext.errors import InvalidSourceProjectionError, SourceProjectionNotFoundError
 from powercontext.sources import Source, SourceDefinitionRegistry, SourceProjectionKey
 
@@ -665,7 +667,42 @@ async def open_builtin_runtime(
         if config.runtime.memory_rerank_enabled and configured_reranker is None:
             raise BuiltinConfigurationError("memory-reranker")
         _require_decision_backend(config.runtime, configured_decision)
+        await _open_source_count_trigger(resources, config, contexts, runtime)
         yield runtime
+
+
+async def _open_source_count_trigger(
+    resources: AsyncExitStack,
+    config: BuiltinConfig,
+    contexts: object,
+    runtime: object,
+) -> None:
+    """Start count admission only for the Families that configured a threshold."""
+
+    count_families: list[tuple[str, object, int]] = []
+    memory_threshold = config.runtime.memory_source_count_threshold
+    if memory_threshold is not None:
+
+        async def _flush_memory(scope_id: str) -> None:
+            await runtime.memory.for_scope(scope_id).flush()  # type: ignore[attr-defined]
+
+        count_families.append((SOURCE_WINDOW_TRIGGER_NAME, _flush_memory, memory_threshold))
+    topic_threshold = config.runtime.topic_memory_source_count_threshold
+    if topic_threshold is not None:
+
+        async def _flush_topic(scope_id: str) -> None:
+            await runtime.topic_memory.for_scope(scope_id).flush()  # type: ignore[attr-defined]
+
+        count_families.append((TOPIC_MEMORY_SOURCE_WINDOW_BINDING, _flush_topic, topic_threshold))
+    if not count_families:
+        return
+    trigger = SourceCountTrigger(
+        contexts.database,  # type: ignore[attr-defined]
+        families=tuple(count_families),
+        lock=runtime._processor_lock,  # type: ignore[attr-defined]
+    )
+    await trigger.start()
+    resources.push_async_callback(trigger.stop)
 
 
 def _validate_processing_source_registry(
