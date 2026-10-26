@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -56,6 +57,8 @@ class _PreparedContextEntry:
     citation: dict[str, object]
     content: str
     truncated: bool
+    start: int | None = None
+    end: int | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +96,16 @@ class PreparedContextOmissions:
 
 
 @dataclass(frozen=True)
+class MemoryFragment:
+    """One literal slice of a Memory entry selected as evidence for the query."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
 class PreparedContextBuild:
     """Final public context and the exact origins selected to produce it.
 
@@ -106,6 +119,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[MemoryFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -211,6 +225,13 @@ class PreparedContextBuilder:
         profile_candidates: Sequence[PreparedProfileCandidate] = (),
         code_candidates: Sequence[PreparedCodeCandidate] = (),
     ) -> PreparedContextBuild:
+        if request.evidence_selection:
+            return self.build_evidence_selection(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+
         if request.include_code:
 
             def historical(history_request: PrepareContextRequest, entries: int) -> PreparedContextBuild:
@@ -254,6 +275,38 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+        )
+
+    def build_evidence_selection(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates] = (),
+    ) -> PreparedContextBuild:
+        """Select literal Memory slices that answer the query inside the byte budget."""
+
+        spans = _rank_evidence_spans(request.query, memory_candidates)
+        entries: list[_PreparedContextEntry] = []
+        fragments: list[MemoryFragment] = []
+        origins: list[PreparedContextOrigin] = []
+        for entry, fragment in spans:
+            if _rendered_bytes([*entries, entry]) > request.max_bytes:
+                continue
+            entries.append(entry)
+            fragments.append(fragment)
+            origins.append(entry.origin)
+        if not entries:
+            return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
+        content = _render(entries)
+        return PreparedContextBuild(
+            context=PreparedContext(
+                status="ready",
+                content=content,
+                content_bytes=len(content.encode("utf-8")),
+            ),
+            origins=tuple(origins),
+            fragments=tuple(fragments),
         )
 
     def probe_budget(
@@ -715,6 +768,9 @@ def _render_entry(entry: _PreparedContextEntry) -> dict[str, object]:
         "content": entry.content,
         "truncated": entry.truncated,
     }
+    if entry.start is not None and entry.end is not None:
+        rendered["start"] = entry.start
+        rendered["end"] = entry.end
     if entry.kind != "memory":
         rendered["kind"] = entry.kind
     return rendered
@@ -728,3 +784,72 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
     prefix_budget = byte_budget - len(_ELLIPSIS.encode("utf-8"))
     encoded_prefix = text.encode("utf-8")[:prefix_budget]
     return f"{encoded_prefix.decode('utf-8', errors='ignore')}{_ELLIPSIS}"
+
+
+_EVIDENCE_TOKEN = re.compile(r"[a-z0-9]+")
+_EVIDENCE_SENTENCE = re.compile(r"[^.!?\n]+[.!?]*")
+
+
+def _query_terms(query: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(token for token in _EVIDENCE_TOKEN.findall(query.casefold()) if len(token) > 1))
+
+
+def _span_score(body: str, terms: tuple[str, ...]) -> int:
+    words = _EVIDENCE_TOKEN.findall(body.casefold())
+    if not words:
+        return 0
+    present = set(words)
+    return sum(1 for term in terms if term in present)
+
+
+def _rank_evidence_spans(
+    query: str,
+    memory_candidates: Sequence[PreparedMemoryCandidates],
+) -> list[tuple[_PreparedContextEntry, MemoryFragment]]:
+    """Rank literal sentence slices by query overlap, then fill with the rest."""
+
+    terms = _query_terms(query)
+    ranked: list[tuple[int, int, _PreparedContextEntry, MemoryFragment]] = []
+    filler: list[tuple[_PreparedContextEntry, MemoryFragment]] = []
+    order = 0
+    for group in memory_candidates:
+        for hit in group.hits:
+            text = hit.text
+            if not text or not text.strip():
+                continue
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+            citation: dict[str, object] = {
+                "scope_id": group.scope_id,
+                "memory_ref": hit.memory_ref.model_dump(mode="json"),
+                "entry_id": hit.entry_id,
+                "entry_version_id": hit.entry_version_id,
+            }
+            for match in _EVIDENCE_SENTENCE.finditer(text):
+                start, end = match.span()
+                body = text[start:end]
+                if not body.strip():
+                    continue
+                entry = _PreparedContextEntry(
+                    origin=address,
+                    kind="memory",
+                    citation=citation,
+                    content=body,
+                    truncated=False,
+                    start=start,
+                    end=end,
+                )
+                fragment = MemoryFragment(address=address, start=start, end=end, text=body)
+                score = _span_score(body, terms)
+                order += 1
+                if score:
+                    ranked.append((-score, order, entry, fragment))
+                else:
+                    filler.append((entry, fragment))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    ordered = [(entry, fragment) for _score, _order, entry, fragment in ranked]
+    ordered.extend(filler)
+    return ordered
