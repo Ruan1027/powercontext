@@ -128,6 +128,7 @@ from powercontext.builtin.runtime.artifact_processing import (
 )
 from powercontext.builtin.runtime.config import BuiltinConfig, ExternalSkillsConfig, InferenceConfig, RuntimeConfig
 from powercontext.builtin.runtime.count_trigger import SourceCountTrigger
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
 from powercontext.builtin.runtime.decision_model import (
     DECISION_INSTRUCTIONS,
     DecisionInput,
@@ -655,6 +656,7 @@ async def open_builtin_runtime(
                 remote_ingestion=contexts,
             )
         )
+        runtime.lifecycle = SourceLifecycleApplication(runtime, contexts)
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
             _open_artifact_processing_supervisor(config, contexts, processing_bindings, tracing=tracing)
         )

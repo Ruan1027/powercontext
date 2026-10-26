@@ -895,7 +895,24 @@ RECALL_TOKEN_DAILY_TABLE = Table(
     CheckConstraint("recalled_tokens >= 0", name="ck_pc_recall_token_daily_recalled_nonnegative"),
 )
 
+SOURCE_LIFECYCLE_TABLE = Table(
+    "pc_source_lifecycle",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("family", String(16), nullable=False),
+    Column("ordinal", BigInteger, nullable=False),
+    Column("reference", String(8000), nullable=False),
+    Column("parents", String(4000), nullable=False),
+    Column("policy", String(8), nullable=False),
+    Column("revision", BigInteger, nullable=False),
+    Column("sequence", BigInteger, nullable=False),
+    Column("available", Integer, nullable=False),
+    Column("payload", String(200000), nullable=True),
+)
+
 SHARED_TABLES = (
+    SOURCE_LIFECYCLE_TABLE,
     SOURCE_JOURNAL_HEADS_TABLE,
     SOURCES_TABLE,
     ARTIFACTS_TABLE,
